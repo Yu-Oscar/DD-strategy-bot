@@ -13,7 +13,6 @@ project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
 from adapters import create_adapter
-from risk import IndicatorTool
 
 config_path = os.path.join(current_dir, "config.yaml")
 
@@ -26,17 +25,13 @@ GRID_CONFIG = config['grid']
 
 
 def generate_grid_arrays(current_price, price_step, grid_count, price_spread):
-    """根据当前价格和价格间距生成做多数组和做空数组，过滤超过当前价格上下1%的价格"""
+    """根据当前价格和价格间距生成做多数组和做空数组"""
     if price_step <= 0:
         raise ValueError("price_step 必须大于 0")
     if grid_count < 0:
         raise ValueError("grid_count 必须大于等于 0")
     if price_spread < 0:
         raise ValueError("price_spread 必须大于等于 0")
-    
-    # 计算价格上下限（当前价格的上下1%）
-    price_upper_limit = current_price * 1.01  # 上限：当前价格 +1%
-    price_lower_limit = current_price * 0.99   # 下限：当前价格 -1%
     
     # 计算 bid 和 ask 价格
     bid_price = current_price - price_spread
@@ -52,18 +47,14 @@ def generate_grid_arrays(current_price, price_step, grid_count, price_spread):
     long_grid = []
     for i in range(grid_count):
         price = bid_base - i * price_step
-        # 过滤：做多价格不能低于当前价格的1%（即不能低于 price_lower_limit）
-        if price >= price_lower_limit:
-            long_grid.append(price)
+        long_grid.append(price)
     long_grid = sorted(long_grid)
     
     # 做空数组：从 ask_base 向上 grid_count 个（包括 ask_base）
     short_grid = []
     for i in range(grid_count):
         price = ask_base + i * price_step
-        # 过滤：做空价格不能超过当前价格的1%（即不能高于 price_upper_limit）
-        if price <= price_upper_limit:
-            short_grid.append(price)
+        short_grid.append(price)
     short_grid = sorted(short_grid)
     
     return long_grid, short_grid
@@ -280,37 +271,6 @@ def close_position_if_exists(adapter, symbol):
         pass
 
 
-def calculate_dynamic_price_spread(adx, current_price, default_spread, adx_threshold):
-    """根据 ADX 值动态计算 price_spread
-    
-    Args:
-        adx: ADX 指标值
-        current_price: 当前价格
-        default_spread: 默认 price_spread
-        adx_threshold: ADX 阈值，低于此值使用默认值
-    
-    Returns:
-        int: 计算后的 price_spread
-    """
-    max_spread = current_price * 0.01  # 最大为价格的1%
-    
-    if adx is not None:
-        print(f"ADX(5m): {adx:.2f}")
-        # ADX <= threshold 时使用默认值，ADX > threshold 时按比例增加
-        if adx <= adx_threshold:
-            price_spread = default_spread
-        else:
-            # ADX 在 [threshold, 100] 范围内映射到 [默认值, 最大值]
-            ratio = (adx - adx_threshold) / (100 - adx_threshold)  # ADX threshold-100 映射到 0-1
-            dynamic_spread = default_spread + ratio * (max_spread - default_spread)
-            price_spread = int(min(dynamic_spread, max_spread))
-        print(f"动态 price_spread: {price_spread} (默认: {default_spread}, 最大: {int(max_spread)})")
-        return price_spread
-    else:
-        print(f"ADX(5m): 获取失败，使用默认 price_spread: {default_spread}")
-        return default_spread
-
-
 def run_strategy_cycle(adapter):
     """执行一次策略循环
     
@@ -320,20 +280,12 @@ def run_strategy_cycle(adapter):
     price_info = adapter.get_ticker(SYMBOL)
     last_price = price_info.get('last_price') or price_info.get('mid_price') or price_info.get('mark_price')
     print(f"{SYMBOL} 价格: {last_price:.2f}")
-
-    # 获取 ADX 指标并动态调整 price_spread
-    indicator_tool = IndicatorTool()
-    adx = indicator_tool.get_adx(SYMBOL, "5m", period=14)
-    
-    default_spread = GRID_CONFIG['price_spread']
-    adx_threshold = GRID_CONFIG.get('adx_threshold', 25)
-    price_spread = calculate_dynamic_price_spread(adx, last_price, default_spread, adx_threshold)
     
     long_grid, short_grid = generate_grid_arrays(
         last_price, 
         GRID_CONFIG['price_step'], 
         GRID_CONFIG['grid_count'],
-        price_spread
+        GRID_CONFIG['price_spread']
     )
     print(f"做多数组: {long_grid}")
     print(f"做空数组: {short_grid}")
