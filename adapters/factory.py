@@ -6,15 +6,20 @@ This module provides a factory function to create exchange adapters based on con
 from typing import Dict, Any, Type
 from adapters.base_adapter import BasePerpAdapter
 from adapters.standx_adapter import StandXAdapter
-from adapters.grvt_adapter import GrvtAdapter
 
 # 注册所有可用的适配器
 _ADAPTER_REGISTRY: Dict[str, Type[BasePerpAdapter]] = {
     "standx": StandXAdapter,
-    "grvt": GrvtAdapter,
     # 未来可以添加更多交易所适配器
     # "nado": NadoAdapter,
 }
+
+# Try to import GRVT adapter (optional dependency)
+try:
+    from adapters.grvt_adapter import GrvtAdapter
+    _ADAPTER_REGISTRY["grvt"] = GrvtAdapter
+except ImportError:
+    pass  # pysdk not installed, skip GRVT adapter
 
 
 def create_adapter(config: Dict[str, Any]) -> BasePerpAdapter:

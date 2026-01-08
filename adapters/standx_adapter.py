@@ -30,24 +30,32 @@ from web3 import Web3
 
 class StandXAdapter(BasePerpAdapter):
     """StandX 交易所适配器实现"""
-    
+
     def __init__(self, config: Dict[str, Any]):
         """
         初始化 StandX 适配器
-        
+
         Args:
             config: 配置字典，必须包含：
                 - exchange_name: "standx"
-                - private_key: 钱包私钥
-                - chain: 链名称，如 "bsc" 或 "solana"
+                - private_key: 钱包私钥（可选，优先使用环境变量 STANDX_PRIVATE_KEY）
+                - chain: 链名称，如 "bsc" 或 "solana"（可选，优先使用环境变量 STANDX_CHAIN）
                 - base_url: API 基础 URL（可选，默认 https://perps.standx.com）
+
+        环境变量优先级高于配置字典，推荐使用环境变量存储私钥
         """
         super().__init__(config)
-        self.private_key = config.get("private_key")
+
+        # 优先从环境变量获取私钥（更安全）
+        self.private_key = os.environ.get("STANDX_PRIVATE_KEY") or config.get("private_key")
         if not self.private_key:
-            raise ValueError("配置中必须包含 private_key")
+            raise ValueError(
+                "未找到私钥。请设置环境变量 STANDX_PRIVATE_KEY 或在配置中提供 private_key。\n"
+                "推荐使用环境变量: export STANDX_PRIVATE_KEY=你的私钥"
+            )
         
-        self.chain = config.get("chain", "bsc")
+        # 优先从环境变量获取链配置
+        self.chain = os.environ.get("STANDX_CHAIN") or config.get("chain", "bsc")
         base_url = config.get("base_url", "https://perps.standx.com")
         
         # 初始化客户端

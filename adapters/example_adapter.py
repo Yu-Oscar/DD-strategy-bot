@@ -3,6 +3,19 @@
 适配器使用示例
 
 演示如何使用统一的适配器接口编写策略
+
+安全配置说明:
+    私钥应通过环境变量配置，而不是硬编码在代码中。
+
+    方法1 - 使用 .env 文件（推荐）:
+        1. 复制 .env.example 为 .env
+        2. 在 .env 中设置: STANDX_PRIVATE_KEY=你的私钥
+        3. 安装 python-dotenv: pip install python-dotenv
+        4. 代码会自动加载 .env 文件
+
+    方法2 - 直接设置环境变量:
+        Windows: set STANDX_PRIVATE_KEY=你的私钥
+        Linux/Mac: export STANDX_PRIVATE_KEY=你的私钥
 """
 import sys
 import os
@@ -11,15 +24,23 @@ from decimal import Decimal
 # 添加项目路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+# 加载 .env 文件（如果存在）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv 未安装，跳过
+
 from adapters import create_adapter, get_available_exchanges
 
 
 # ==================== 配置区域 ====================
-# 统一配置：只需要在这里修改即可，所有示例函数都会使用
+# 私钥通过环境变量 STANDX_PRIVATE_KEY 配置（不要在代码中硬编码！）
+# 链配置可通过环境变量 STANDX_CHAIN 配置，默认 bsc
 STANDX_CONFIG = {
     "exchange_name": "standx",
-    "private_key": "",
-    "chain": "bsc",
+    # private_key 从环境变量自动读取，无需在此配置
+    # chain 从环境变量自动读取，默认 bsc
 }
 # ================================================
 

@@ -3,3 +3,11 @@
 strategys/strategy_standx/config.yaml
 strategys/strategy_standx/config.yaml
 *.pyc
+
+# Environment files (NEVER commit these!)
+.env
+.env.local
+.env.*.local
+
+# Keep the example file
+!.env.example

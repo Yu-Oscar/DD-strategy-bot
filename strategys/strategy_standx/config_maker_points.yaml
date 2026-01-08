@@ -1,0 +1,36 @@
+# StandX Maker Points Strategy Configuration
+# Optimized for maximum points with minimum fill risk
+
+exchange:
+  exchange_name: standx
+  chain: bsc
+
+symbol: BTC-USD
+
+maker_points:
+  # Target distance from mark price (in basis points)
+  # 0-10 bps = 100% points, 10-30 bps = 50% points, 30-100 bps = 10% points
+  #
+  # Strategy: Place at center of band (5 bps) for maximum buffer
+  # - Order can drift 5 bps in either direction before needing rebalance
+  # - Trade-off: slightly higher fill risk than 9 bps
+  target_bps: 5             # Place at center of 0-10 bps band for max buffer
+
+  # Order sizing
+  # With 1x leverage, use percentage of balance for single side
+  balance_percent: 90       # Use 10% of available balance
+
+  # Rebalancing
+  rebalance_interval: 1     # Check every 5 seconds (less frequent = less API calls)
+
+  # Band monitoring - when to rebalance
+  min_bps: 1                # Rebalance if order gets too close to mark (fill risk)
+  max_bps: 9                # Rebalance if order drifts too far (before losing 100% tier)
+
+  # Risk management
+  auto_close_position: true # Immediately close any filled positions
+
+  # Order side: "buy", "sell", or "both"
+  # With 1x leverage, can only do one side at a time
+  # Set to "buy" or "sell" based on your market view
+  order_side: buy           # Start with buy side only
