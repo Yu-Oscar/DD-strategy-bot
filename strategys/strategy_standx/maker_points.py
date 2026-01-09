@@ -278,6 +278,10 @@ def close_any_position(adapter, symbol):
             print("[RISK] Closing position with market order...")
             adapter.close_position(symbol, order_type="market")
             print("[RISK] Position closed")
+            print("[WAIT] Waiting 2 seconds for balance to update...")
+            sys.stdout.flush()  # Ensure output is visible
+            time.sleep(3)
+            print("[WAIT] Wait complete, balance should be updated...")
             return True
     except Exception:
         pass
@@ -303,6 +307,7 @@ def run_strategy_cycle(adapter, config, tracker, dry_run=False):
     max_bps = mp_config.get('max_bps', 10)
     balance_percent = mp_config['balance_percent']
     order_side = mp_config['order_side']
+    leverage = mp_config.get('leverage', 1)  # Default to 1x if not specified
     auto_close = mp_config.get('auto_close_position', True)
 
     # 1. Get current mark price
@@ -320,14 +325,16 @@ def run_strategy_cycle(adapter, config, tracker, dry_run=False):
     print(f"[INFO] {symbol} Mark Price: ${mark_price:,.2f}")
 
     # 2. Check and close any positions
+    position_closed = False
     if auto_close:
-        close_any_position(adapter, symbol)
+        position_closed = close_any_position(adapter, symbol)
 
-    # 3. Get balance
+    # 3. Get balance (re-fetch if position was closed to get updated balance)
     try:
         balance = adapter.get_balance()
         available = float(balance.available_balance)
         print(f"[INFO] Available Balance: ${available:,.2f}")
+        # If position was just closed, the balance should already be updated after the 2-second wait
     except Exception as e:
         print(f"[ERROR] Failed to get balance: {e}")
         return False
@@ -379,6 +386,22 @@ def run_strategy_cycle(adapter, config, tracker, dry_run=False):
                 try:
                     adapter.cancel_order(order_id=existing_order.order_id)
                     print(f"[CANCELLED] Order {existing_order.order_id}")
+                    print("[WAIT] Waiting 2 seconds for balance to update...")
+                    sys.stdout.flush()  # Ensure output is visible
+                    time.sleep(2)
+                    print("[WAIT] Wait complete, fetching updated balance...")
+                    # Re-fetch balance after cancel
+                    try:
+                        balance = adapter.get_balance()
+                        available = float(balance.available_balance)
+                        print(f"[INFO] Updated Available Balance: ${available:,.2f}")
+                        # Recalculate order with updated balance
+                        target_quantity = calculate_order_quantity(available, mark_price, balance_percent)
+                        target_notional = float(target_price * target_quantity)
+                        print(f"[INFO] Updated Target: {order_side.upper()} {target_quantity} @ ${target_price}")
+                        print(f"[INFO] Updated Notional: ${target_notional:,.2f}")
+                    except Exception as e:
+                        print(f"[WARN] Failed to refresh balance: {e}")
                 except Exception as e:
                     print(f"[ERROR] Failed to cancel: {e}")
             else:
@@ -401,7 +424,8 @@ def run_strategy_cycle(adapter, config, tracker, dry_run=False):
             quantity=target_quantity,
             price=target_price,
             time_in_force="gtc",
-            reduce_only=False
+            reduce_only=False,
+            leverage=leverage
         )
         print(f"[SUCCESS] Order placed: {order.order_id}")
 
