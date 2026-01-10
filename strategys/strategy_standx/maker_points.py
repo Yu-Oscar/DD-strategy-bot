@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-StandX Maker Points Strategy
+StandX Maker Points Strategy (Two-Sided)
 
-Maximizes maker points with minimal fill risk using 1x leverage.
+Maximizes maker points with minimal fill risk using both buy and sell orders.
 
 Strategy:
-- Places single limit order at 5 bps from mark price (100% points tier)
-- Monitors order position relative to mark price
-- Rebalances when order drifts outside target band
+- Places TWO limit orders: buy below mark price, sell above mark price
+- Each side uses 50% of the configured balance_percent
+- Monitors order positions relative to mark price
+- Rebalances when orders drift outside target band
 - Auto-closes any filled positions immediately
-- Tracks and logs estimated points earned
 
 Usage:
     python maker_points.py                          # Run with default config
@@ -21,7 +21,6 @@ import os
 import yaml
 import time
 import argparse
-import json
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 
@@ -39,134 +38,22 @@ except ImportError:
 
 from adapters import create_adapter
 
-
-# Global config
-CONFIG = None
-ADAPTER = None
+# Track order start times by side: {"buy": timestamp, "sell": timestamp}
+ORDER_START_TIMES = {}
 
 
-class PointsTracker:
-    """Track and log estimated maker points"""
-
-    def __init__(self, log_file="maker_points_log.json"):
-        self.log_file = os.path.join(current_dir, log_file)
-        self.session_start = datetime.now()
-        self.total_points = 0.0
-        self.total_earning_seconds = 0
-        self.orders = []  # List of order tracking data
-        self.current_order = None
-
-        # Load existing log if available
-        self.load_log()
-
-    def load_log(self):
-        """Load existing log file"""
-        try:
-            if os.path.exists(self.log_file):
-                with open(self.log_file, 'r') as f:
-                    data = json.load(f)
-                    self.total_points = data.get('total_points', 0.0)
-                    self.orders = data.get('orders', [])
-        except Exception:
-            pass
-
-    def save_log(self):
-        """Save log to file"""
-        try:
-            data = {
-                'last_updated': datetime.now().isoformat(),
-                'total_points': round(self.total_points, 4),
-                'total_earning_seconds': self.total_earning_seconds,
-                'session_start': self.session_start.isoformat(),
-                'orders': self.orders[-100:]  # Keep last 100 orders
-            }
-            with open(self.log_file, 'w') as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            print(f"[WARN] Failed to save log: {e}")
-
-    def start_order(self, order_id, price, quantity, notional, bps):
-        """Start tracking a new order"""
-        self.current_order = {
-            'order_id': str(order_id),
-            'start_time': time.time(),
-            'price': float(price),
-            'quantity': float(quantity),
-            'notional': float(notional),
-            'start_bps': float(bps),
-            'points_earned': 0.0
-        }
-
-    def update_order(self, current_bps):
-        """Update current order tracking with current bps"""
-        if not self.current_order:
-            return 0.0
-
-        now = time.time()
-        elapsed = now - self.current_order.get('last_update', self.current_order['start_time'])
-        self.current_order['last_update'] = now
-        self.current_order['current_bps'] = float(current_bps)
-
-        # Calculate points for this period
-        # Points formula: notional × multiplier × (time / 86400)
-        multiplier = self.get_multiplier(current_bps)
-        notional = self.current_order['notional']
-        points = notional * multiplier * (elapsed / 86400)
-
-        self.current_order['points_earned'] += points
-        self.total_points += points
-        self.total_earning_seconds += elapsed
-
-        return points
-
-    def end_order(self, reason="rebalance"):
-        """End tracking current order"""
-        if not self.current_order:
-            return
-
-        self.current_order['end_time'] = time.time()
-        self.current_order['duration'] = self.current_order['end_time'] - self.current_order['start_time']
-        self.current_order['end_reason'] = reason
-
-        self.orders.append(self.current_order)
-        self.save_log()
-        self.current_order = None
-
-    def get_multiplier(self, bps):
-        """Get points multiplier based on bps distance"""
-        if bps <= 0:
-            return 0.0
-        elif bps <= 10:
-            return 1.0      # 100% points
-        elif bps <= 30:
-            return 0.5      # 50% points
-        elif bps <= 100:
-            return 0.1      # 10% points
-        else:
-            return 0.0      # No points
-
-    def get_stats(self):
-        """Get current session stats"""
-        session_duration = (datetime.now() - self.session_start).total_seconds()
-        points_per_hour = (self.total_points / session_duration * 3600) if session_duration > 0 else 0
-        points_per_day = points_per_hour * 24
-
-        return {
-            'total_points': round(self.total_points, 4),
-            'session_duration_min': round(session_duration / 60, 1),
-            'earning_time_min': round(self.total_earning_seconds / 60, 1),
-            'uptime_percent': round(self.total_earning_seconds / session_duration * 100, 1) if session_duration > 0 else 0,
-            'points_per_hour': round(points_per_hour, 2),
-            'projected_daily': round(points_per_day, 0)
-        }
-
-    def print_stats(self):
-        """Print current stats"""
-        stats = self.get_stats()
-        print(f"\n[POINTS] Total: {stats['total_points']:.4f} | "
-              f"Rate: {stats['points_per_hour']:.2f}/hr | "
-              f"Projected: ~{stats['projected_daily']:.0f}/day | "
-              f"Uptime: {stats['uptime_percent']:.1f}%")
+def format_uptime(seconds):
+    """Format uptime in human readable format"""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{mins}m{secs}s"
+    else:
+        hours = int(seconds // 3600)
+        mins = int((seconds % 3600) // 60)
+        return f"{hours}h{mins}m"
 
 
 def load_config(config_file="config_maker_points.yaml"):
@@ -248,54 +135,35 @@ def get_current_bps(order_price, mark_price, side):
     return float(bps)
 
 
-def get_existing_order(adapter, symbol, side):
+def get_existing_orders(adapter, symbol):
     """
-    Get existing open order for the given side
+    Get existing open orders for both sides
 
     Returns:
-        Order object or None
+        dict: {"buy": Order or None, "sell": Order or None}
     """
+    result = {"buy": None, "sell": None}
     try:
         orders = adapter.get_open_orders(symbol=symbol)
         for order in orders:
             if order.status in ["pending", "open", "partially_filled"]:
                 order_side = order.side.lower()
-                if (side == "buy" and order_side in ["buy", "long"]) or \
-                   (side == "sell" and order_side in ["sell", "short"]):
-                    return order
-        return None
+                if order_side in ["buy", "long"]:
+                    result["buy"] = order
+                elif order_side in ["sell", "short"]:
+                    result["sell"] = order
     except Exception as e:
         print(f"Error getting open orders: {e}")
-        return None
+    return result
 
 
-def close_any_position(adapter, symbol):
-    """Close any open position immediately"""
-    try:
-        position = adapter.get_position(symbol)
-        if position and position.size > Decimal("0"):
-            print(f"[RISK] Position detected: {position.size} {position.side}")
-            print("[RISK] Closing position with market order...")
-            adapter.close_position(symbol, order_type="market")
-            print("[RISK] Position closed")
-            print("[WAIT] Waiting 2 seconds for balance to update...")
-            sys.stdout.flush()  # Ensure output is visible
-            time.sleep(3)
-            print("[WAIT] Wait complete, balance should be updated...")
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def run_strategy_cycle(adapter, config, tracker, dry_run=False):
+def run_strategy_cycle(adapter, config, dry_run=False):
     """
-    Execute one strategy cycle
+    Execute one strategy cycle for both buy and sell sides
 
     Args:
         adapter: Exchange adapter
         config: Strategy configuration
-        tracker: PointsTracker instance
         dry_run: If True, don't place real orders
 
     Returns:
@@ -305,137 +173,215 @@ def run_strategy_cycle(adapter, config, tracker, dry_run=False):
     mp_config = config['maker_points']
     target_bps = mp_config['target_bps']
     max_bps = mp_config.get('max_bps', 10)
+    min_bps = mp_config.get('min_bps', 1)
     balance_percent = mp_config['balance_percent']
-    order_side = mp_config['order_side']
-    leverage = mp_config.get('leverage', 1)  # Default to 1x if not specified
+    leverage = mp_config.get('leverage', 1)
     auto_close = mp_config.get('auto_close_position', True)
+
+    # Each side uses half of balance_percent
+    per_side_balance_percent = balance_percent / 2
+    
+    # Action log for UI
+    actions_log = []
 
     # 1. Get current mark price
     try:
         ticker = adapter.get_ticker(symbol)
         mark_price = ticker.get('mark_price') or ticker.get('mid_price') or ticker.get('last_price')
         if not mark_price:
-            print("[ERROR] Could not get mark price")
+            print("❌ 無法獲取價格...")
             return False
         mark_price = float(mark_price)
     except Exception as e:
-        print(f"[ERROR] Failed to get ticker: {e}")
+        print(f"❌ 獲取價格失敗: {e}")
         return False
 
-    print(f"[INFO] {symbol} Mark Price: ${mark_price:,.2f}")
-
     # 2. Check and close any positions
-    position_closed = False
+    position_qty = 0
     if auto_close:
-        position_closed = close_any_position(adapter, symbol)
+        try:
+            position = adapter.get_position(symbol)
+            if position and position.size > Decimal("0"):
+                position_qty = float(position.size)
+                actions_log.append(f"🚨 持倉 {position_qty} {position.side} -> 平倉中...")
+                adapter.close_position(symbol, order_type="market")
+                actions_log.append("✅ 已平倉")
+                time.sleep(3)
+        except Exception:
+            pass
 
-    # 3. Get balance (re-fetch if position was closed to get updated balance)
+    # 3. Get balance
     try:
         balance = adapter.get_balance()
         available = float(balance.available_balance)
-        print(f"[INFO] Available Balance: ${available:,.2f}")
-        # If position was just closed, the balance should already be updated after the 2-second wait
     except Exception as e:
-        print(f"[ERROR] Failed to get balance: {e}")
+        print(f"❌ 獲取餘額失敗: {e}")
         return False
 
-    # 4. Calculate target order
-    target_price = calculate_order_price(mark_price, target_bps, order_side)
-    target_quantity = calculate_order_quantity(available, mark_price, balance_percent)
+    # 4. Get existing orders for both sides
+    existing_orders = get_existing_orders(adapter, symbol)
+    
+    # Track which sides need new orders
+    sides_to_place = []
+    
+    # Store order info for UI display
+    active_orders = []
 
-    if target_quantity < Decimal("0.0001"):
-        print(f"[WARN] Quantity too small: {target_quantity}")
-        return False
+    # 5. Process each side
+    for side in ["buy", "sell"]:
+        target_price = calculate_order_price(mark_price, target_bps, side)
+        target_quantity = calculate_order_quantity(available, mark_price, per_side_balance_percent)
+        
+        if target_quantity < Decimal("0.0001"):
+            continue
 
-    target_notional = float(target_price * target_quantity)
-    print(f"[INFO] Target: {order_side.upper()} {target_quantity} @ ${target_price} ({target_bps} bps)")
-    print(f"[INFO] Notional: ${target_notional:,.2f} = ~{target_notional:.0f} points/day")
+        target_notional = float(target_price * target_quantity)
+        existing_order = existing_orders[side]
 
-    # 5. Check existing order
-    existing_order = get_existing_order(adapter, symbol, order_side)
+        if existing_order:
+            existing_price = float(existing_order.price)
+            current_bps = get_current_bps(existing_price, mark_price, side)
+            
+            # Track order start time if not already tracked
+            if side not in ORDER_START_TIMES:
+                ORDER_START_TIMES[side] = time.time()
+            
+            uptime = time.time() - ORDER_START_TIMES[side]
 
-    if existing_order:
-        existing_price = float(existing_order.price)
-        current_bps = get_current_bps(existing_price, mark_price, order_side)
-        min_bps = mp_config.get('min_bps', 1)
+            # Store for UI display
+            active_orders.append({
+                'side': side,
+                'price': existing_price,
+                'quantity': float(existing_order.quantity),
+                'bps': current_bps,
+                'uptime': uptime
+            })
 
-        # Calculate points earned since last check
-        points_earned = tracker.update_order(current_bps)
-        multiplier = tracker.get_multiplier(current_bps)
-        tier = "100%" if multiplier == 1.0 else "50%" if multiplier == 0.5 else "10%" if multiplier == 0.1 else "0%"
-
-        print(f"[INFO] Existing order: {existing_order.quantity} @ ${existing_price} ({current_bps:.1f} bps, {tier} tier)")
-        print(f"[POINTS] +{points_earned:.6f} this cycle")
-
-        # Check if order is still in good position (between min_bps and max_bps)
-        if min_bps <= current_bps <= max_bps:
-            print(f"[OK] Order at {current_bps:.1f} bps - within {min_bps}-{max_bps} bps band - keeping order")
-            tracker.print_stats()
-            return True
-        else:
-            # Order drifted outside safe band - need to rebalance
-            if current_bps < min_bps:
-                reason = f"too close to mark ({current_bps:.1f} < {min_bps} bps) - fill risk"
+            # Check if order is still in good position
+            if min_bps <= current_bps <= max_bps:
+                continue
             else:
-                reason = f"too far from mark ({current_bps:.1f} > {max_bps} bps) - losing points tier"
+                # Order drifted outside safe band - need to rebalance
+                if current_bps < min_bps:
+                    reason = f"太近 {current_bps:.1f} < {min_bps} bps"
+                else:
+                    reason = f"太遠 {current_bps:.1f} > {max_bps} bps"
 
-            print(f"[REBALANCE] {reason}")
-            tracker.end_order(reason=reason)
+                actions_log.append(f"⚠️ {side.upper()} 偏離 {current_bps:.1f}bps -> 撤單 ({reason})")
+                
+                # Reset uptime tracking for this side
+                if side in ORDER_START_TIMES:
+                    del ORDER_START_TIMES[side]
 
-            if not dry_run:
-                try:
-                    adapter.cancel_order(order_id=existing_order.order_id)
-                    print(f"[CANCELLED] Order {existing_order.order_id}")
-                    print("[WAIT] Waiting 2 seconds for balance to update...")
-                    sys.stdout.flush()  # Ensure output is visible
-                    time.sleep(2)
-                    print("[WAIT] Wait complete, fetching updated balance...")
-                    # Re-fetch balance after cancel
+                if not dry_run:
                     try:
-                        balance = adapter.get_balance()
-                        available = float(balance.available_balance)
-                        print(f"[INFO] Updated Available Balance: ${available:,.2f}")
-                        # Recalculate order with updated balance
-                        target_quantity = calculate_order_quantity(available, mark_price, balance_percent)
-                        target_notional = float(target_price * target_quantity)
-                        print(f"[INFO] Updated Target: {order_side.upper()} {target_quantity} @ ${target_price}")
-                        print(f"[INFO] Updated Notional: ${target_notional:,.2f}")
-                    except Exception as e:
-                        print(f"[WARN] Failed to refresh balance: {e}")
-                except Exception as e:
-                    print(f"[ERROR] Failed to cancel: {e}")
-            else:
-                print(f"[DRY RUN] Would cancel order {existing_order.order_id}")
+                        adapter.cancel_order(order_id=existing_order.order_id)
+                    except Exception:
+                        continue
+                
+                # Remove from active orders since we're cancelling
+                active_orders = [o for o in active_orders if o['side'] != side]
 
-    # 6. Place new order
-    print(f"[PLACE] {order_side.upper()} {target_quantity} @ ${target_price}")
+        # Add to list of sides needing new orders
+        sides_to_place.append({
+            'side': side,
+            'price': target_price,
+            'quantity': target_quantity,
+            'notional': target_notional
+        })
 
+    # 6. Wait for balance update if we cancelled any orders
+    if sides_to_place and not dry_run:
+        time.sleep(2)
+        
+        # Re-fetch balance
+        try:
+            balance = adapter.get_balance()
+            available = float(balance.available_balance)
+            
+            # Recalculate quantities with updated balance
+            for order_info in sides_to_place:
+                order_info['quantity'] = calculate_order_quantity(available, mark_price, per_side_balance_percent)
+                order_info['notional'] = float(order_info['price'] * order_info['quantity'])
+        except Exception:
+            pass
+
+    # 7. Place new orders
+    for order_info in sides_to_place:
+        side = order_info['side']
+        target_price = order_info['price']
+        target_quantity = order_info['quantity']
+        
+        if target_quantity < Decimal("0.0001"):
+            continue
+
+        if dry_run:
+            actions_log.append(f"🔸 [DRY] 掛{side.upper()}單 @ {float(target_price):.2f}")
+            ORDER_START_TIMES[side] = time.time()
+            active_orders.append({
+                'side': side,
+                'price': float(target_price),
+                'quantity': float(target_quantity),
+                'bps': target_bps,
+                'uptime': 0
+            })
+            continue
+
+        try:
+            order = adapter.place_order(
+                symbol=symbol,
+                side=side,
+                order_type="limit",
+                quantity=target_quantity,
+                price=target_price,
+                time_in_force="gtc",
+                reduce_only=False,
+                leverage=leverage
+            )
+            actions_log.append(f"✅ 掛{side.upper()}單 @ {float(target_price):.2f}")
+            ORDER_START_TIMES[side] = time.time()
+            active_orders.append({
+                'side': side,
+                'price': float(target_price),
+                'quantity': float(target_quantity),
+                'bps': target_bps,
+                'uptime': 0
+            })
+        except Exception as e:
+            actions_log.append(f"❌ {side.upper()}單失敗: {e}")
+
+    # 8. Display UI (like main.py)
+    os.system('clear' if os.name != 'nt' else 'cls')
+    
+    print(f"=== 🛡️ StandX Maker Points 挖礦策略 (雙邊) ===")
+    print(f"⏰ 時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"💰 錢包餘額: ${available:,.2f} | 掛單比例: {balance_percent}% ({per_side_balance_percent:.1f}%/邊)")
+    print(f"📊 即時價格: ${mark_price:,.2f}")
+    print(f"🎯 目標: {target_bps} bps | 安全帶: {min_bps}-{max_bps} bps")
+    if position_qty == 0:
+        print(f"🛡️ 持倉: (0) 非常安全")
+    else:
+        print(f"🚨 持倉: {position_qty} (平倉中...)")
+    print("-" * 45)
+    
+    # Display orders
+    if not active_orders:
+        print(" (無掛單，正在補單...)")
+    else:
+        for o in active_orders:
+            side_emoji = "🟢" if o['side'] == 'buy' else "🔴"
+            uptime_str = format_uptime(o.get('uptime', 0))
+            print(f" {side_emoji} [{o['side'].upper()}] ${o['price']:,.2f} x {o['quantity']:.4f} (距 {o['bps']:.1f}bps) ⏱️  {uptime_str}")
+    
+    print("-" * 45)
+    
     if dry_run:
-        print("[DRY RUN] Order not placed")
-        # Still track for simulation
-        tracker.start_order("dry-run", target_price, target_quantity, target_notional, target_bps)
-        return True
+        print("🔸 模式: DRY RUN (不實際下單)")
+    
+    for log in actions_log:
+        print(log)
 
-    try:
-        order = adapter.place_order(
-            symbol=symbol,
-            side=order_side,
-            order_type="limit",
-            quantity=target_quantity,
-            price=target_price,
-            time_in_force="gtc",
-            reduce_only=False,
-            leverage=leverage
-        )
-        print(f"[SUCCESS] Order placed: {order.order_id}")
-
-        # Start tracking the new order
-        tracker.start_order(order.order_id, target_price, target_quantity, target_notional, target_bps)
-
-        return True
-    except Exception as e:
-        print(f"[ERROR] Failed to place order: {e}")
-        return False
+    return True
 
 
 def main():
@@ -448,76 +394,43 @@ def main():
 
     # Load config
     try:
-        print(f"Loading config: {args.config}")
+        print(f"📂 載入設定: {args.config}")
         config = load_config(args.config)
     except FileNotFoundError as e:
-        print(f"Error: {e}")
+        print(f"❌ 錯誤: {e}")
         sys.exit(1)
 
     # Create adapter
     try:
         adapter = create_adapter(config['exchange'])
         adapter.connect()
-        print("Connected to StandX")
+        print("✅ 已連接 StandX")
     except Exception as e:
-        print(f"Connection failed: {e}")
+        print(f"❌ 連接失敗: {e}")
         sys.exit(1)
-
-    # Initialize points tracker
-    tracker = PointsTracker()
-    print(f"Points log: {tracker.log_file}")
-    if tracker.total_points > 0:
-        print(f"Loaded previous points: {tracker.total_points:.4f}")
 
     # Strategy loop
     rebalance_interval = config['maker_points'].get('rebalance_interval', 3)
 
-    print("\n" + "=" * 60)
-    print("MAKER POINTS STRATEGY")
-    print(f"Symbol: {config['symbol']}")
-    print(f"Target: {config['maker_points']['target_bps']} bps (100% points tier)")
-    print(f"Safe band: {config['maker_points'].get('min_bps', 1)}-{config['maker_points'].get('max_bps', 9)} bps")
-    print(f"Side: {config['maker_points']['order_side']}")
-    print(f"Balance %: {config['maker_points']['balance_percent']}%")
-    print(f"Rebalance: every {rebalance_interval}s")
-    if args.dry_run:
-        print("MODE: DRY RUN (no real orders)")
-    print("=" * 60 + "\n")
-
-    print("Starting strategy... Press Ctrl+C to stop\n")
+    print("🚀 啟動 Maker Points 挖礦策略...")
+    print("按 Ctrl+C 停止\n")
+    time.sleep(2)
 
     try:
         while True:
-            run_strategy_cycle(adapter, config, tracker, dry_run=args.dry_run)
-            print(f"\n--- Waiting {rebalance_interval}s ---\n")
+            run_strategy_cycle(adapter, config, dry_run=args.dry_run)
             time.sleep(rebalance_interval)
     except KeyboardInterrupt:
-        print("\n\nStrategy stopped by user")
-
-        # End current order tracking
-        tracker.end_order(reason="user_stopped")
-        tracker.save_log()
-
-        # Print final stats
-        print("\n" + "=" * 60)
-        print("FINAL SESSION STATS")
-        stats = tracker.get_stats()
-        print(f"Total Points Earned: {stats['total_points']:.4f}")
-        print(f"Session Duration: {stats['session_duration_min']:.1f} minutes")
-        print(f"Active Earning Time: {stats['earning_time_min']:.1f} minutes")
-        print(f"Uptime: {stats['uptime_percent']:.1f}%")
-        print(f"Average Rate: {stats['points_per_hour']:.2f} points/hour")
-        print(f"Projected Daily: ~{stats['projected_daily']:.0f} points/day")
-        print("=" * 60)
+        print("\n\n🛑 策略已停止")
 
         # Cancel all orders on exit
         if not args.dry_run:
-            print("\nCancelling open orders...")
+            print("\n🔄 撤銷所有掛單...")
             try:
                 adapter.cancel_all_orders(symbol=config['symbol'])
-                print("Orders cancelled")
+                print("✅ 已撤銷")
             except Exception as e:
-                print(f"Failed to cancel orders: {e}")
+                print(f"❌ 撤單失敗: {e}")
 
 
 if __name__ == "__main__":
