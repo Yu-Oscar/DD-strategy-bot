@@ -25,8 +25,8 @@ maker_points:
   rebalance_interval: 0.5 # Check every 1 seconds (less frequent = less API calls)
 
   # Band monitoring - when to rebalance
-  min_bps: 0.1 # Rebalance if order gets too close to mark (fill risk)
-  max_bps: 9.9 # Rebalance if order drifts too far (before losing 100% tier)
+  min_bps: 2 # Rebalance if order gets too close to mark (fill risk)
+  max_bps: 8 # Rebalance if order drifts too far (before losing 100% tier)
 
   # Risk management
   auto_close_position: true # Immediately close any filled positions

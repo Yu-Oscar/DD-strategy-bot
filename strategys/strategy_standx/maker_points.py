@@ -201,22 +201,41 @@ def run_strategy_cycle(adapter, config, dry_run=False):
     if auto_close:
         try:
             position = adapter.get_position(symbol)
-            if position and position.size > Decimal("0"):
-                position_qty = float(position.size)
+            # Check for any position (size != 0, handles both long and short)
+            if position and position.size != Decimal("0"):
+                position_qty = float(abs(position.size))
                 actions_log.append(f"🚨 持倉 {position_qty} {position.side} -> 平倉中...")
+                
+                # Cancel all orders first to free up margin
+                try:
+                    adapter.cancel_all_orders(symbol=symbol)
+                    actions_log.append("🔄 已撤銷所有掛單")
+                    time.sleep(2)
+                except Exception:
+                    pass
+                
+                # Close the position
                 adapter.close_position(symbol, order_type="market")
                 actions_log.append("✅ 已平倉")
-                time.sleep(3)
-        except Exception:
-            pass
+                time.sleep(5)
+        except Exception as e:
+            actions_log.append(f"❌ 平倉失敗: {e}")
 
-    # 3. Get balance
+    # 3. Get balance - use total equity for order sizing (not available balance)
     try:
         balance = adapter.get_balance()
+        # Use total equity for consistent order sizing across both sides
+        total_equity = float(getattr(balance, 'total_balance', None) or 
+                            getattr(balance, 'equity', None) or 
+                            balance.available_balance)
         available = float(balance.available_balance)
     except Exception as e:
         print(f"❌ 獲取餘額失敗: {e}")
         return False
+
+    # Calculate fixed order quantity based on total equity (not remaining balance)
+    # This ensures both sides have equal size regardless of which one rebalances
+    fixed_quantity = calculate_order_quantity(total_equity, mark_price, per_side_balance_percent)
 
     # 4. Get existing orders for both sides
     existing_orders = get_existing_orders(adapter, symbol)
@@ -230,8 +249,8 @@ def run_strategy_cycle(adapter, config, dry_run=False):
     # 5. Process each side
     for side in ["buy", "sell"]:
         target_price = calculate_order_price(mark_price, target_bps, side)
-        target_quantity = calculate_order_quantity(available, mark_price, per_side_balance_percent)
-        
+        target_quantity = fixed_quantity  # Use fixed quantity based on total equity
+
         if target_quantity < Decimal("0.0001"):
             continue
 
@@ -268,7 +287,7 @@ def run_strategy_cycle(adapter, config, dry_run=False):
                     reason = f"太遠 {current_bps:.1f} > {max_bps} bps"
 
                 actions_log.append(f"⚠️ {side.upper()} 偏離 {current_bps:.1f}bps -> 撤單 ({reason})")
-                
+
                 # Reset uptime tracking for this side
                 if side in ORDER_START_TIMES:
                     del ORDER_START_TIMES[side]
@@ -290,21 +309,10 @@ def run_strategy_cycle(adapter, config, dry_run=False):
             'notional': target_notional
         })
 
-    # 6. Wait for balance update if we cancelled any orders
+    # 6. Wait for balance update if we need to place new orders
     if sides_to_place and not dry_run:
-        time.sleep(2)
-        
-        # Re-fetch balance
-        try:
-            balance = adapter.get_balance()
-            available = float(balance.available_balance)
-            
-            # Recalculate quantities with updated balance
-            for order_info in sides_to_place:
-                order_info['quantity'] = calculate_order_quantity(available, mark_price, per_side_balance_percent)
-                order_info['notional'] = float(order_info['price'] * order_info['quantity'])
-        except Exception:
-            pass
+        time.sleep(5)
+        # No need to recalculate - we use fixed quantity based on total equity
 
     # 7. Place new orders
     for order_info in sides_to_place:
@@ -355,7 +363,7 @@ def run_strategy_cycle(adapter, config, dry_run=False):
     
     print(f"=== 🛡️ StandX Maker Points 挖礦策略 (雙邊) ===")
     print(f"⏰ 時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"💰 錢包餘額: ${available:,.2f} | 掛單比例: {balance_percent}% ({per_side_balance_percent:.1f}%/邊)")
+    print(f"💰 總權益: ${total_equity:,.2f} | 可用: ${available:,.2f} | 掛單: {balance_percent}% ({per_side_balance_percent:.1f}%/邊)")
     print(f"📊 即時價格: ${mark_price:,.2f}")
     print(f"🎯 目標: {target_bps} bps | 安全帶: {min_bps}-{max_bps} bps")
     if position_qty == 0:
@@ -371,7 +379,7 @@ def run_strategy_cycle(adapter, config, dry_run=False):
         for o in active_orders:
             side_emoji = "🟢" if o['side'] == 'buy' else "🔴"
             uptime_str = format_uptime(o.get('uptime', 0))
-            print(f" {side_emoji} [{o['side'].upper()}] ${o['price']:,.2f} x {o['quantity']:.4f} (距 {o['bps']:.1f}bps) ⏱️  {uptime_str}")
+            print(f" {side_emoji} [{o['side'].upper()}] ${o['price']:,.2f} x {o['quantity']:.4f} (距 {o['bps']:.1f}bps) ⏱️     {uptime_str}")
     
     print("-" * 45)
     
@@ -423,14 +431,28 @@ def main():
     except KeyboardInterrupt:
         print("\n\n🛑 策略已停止")
 
-        # Cancel all orders on exit
         if not args.dry_run:
+            symbol = config['symbol']
+            
+            # Cancel all orders first
             print("\n🔄 撤銷所有掛單...")
             try:
-                adapter.cancel_all_orders(symbol=config['symbol'])
-                print("✅ 已撤銷")
+                adapter.cancel_all_orders(symbol=symbol)
+                print("✅ 已撤銷掛單")
             except Exception as e:
                 print(f"❌ 撤單失敗: {e}")
+            
+            # Close all positions
+            print("\n🔄 平倉所有持倉...")
+            try:
+                position = adapter.get_position(symbol)
+                if position and position.size != Decimal("0"):
+                    adapter.close_position(symbol, order_type="market")
+                    print(f"✅ 已平倉 {abs(position.size)} {position.side}")
+                else:
+                    print("✅ 無持倉")
+            except Exception as e:
+                print(f"❌ 平倉失敗: {e}")
 
 
 if __name__ == "__main__":
