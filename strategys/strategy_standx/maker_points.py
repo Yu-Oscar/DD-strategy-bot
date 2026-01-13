@@ -12,13 +12,12 @@ Strategy:
 - Auto-closes any filled positions immediately
 
 Usage:
-    python maker_points.py                          # Run with default config
-    python maker_points.py -c config_maker_points.yaml  # Specify config
+    python maker_points.py                          # Run with embedded config
+    python maker_points.py -c config.yaml           # Specify custom config file (optional)
     python maker_points.py --dry-run                # Simulate without placing orders
 """
 import sys
 import os
-import yaml
 import time
 import argparse
 from datetime import datetime
@@ -38,8 +37,47 @@ except ImportError:
 
 from adapters import create_adapter
 
+# Default configuration (previously in config_maker_points.yaml)
+DEFAULT_CONFIG = {
+    'exchange': {
+        'exchange_name': 'standx',
+        'chain': 'bsc'
+    },
+    'symbol': 'BTC-USD',
+    'maker_points': {
+        # Target distance from mark price (in basis points)
+        # 0-10 bps = 100% points, 10-30 bps = 50% points, 30-100 bps = 10% points
+        #
+        # Strategy: Place at center of band (5 bps) for maximum buffer
+        # - Order can drift 5 bps in either direction before needing rebalance
+        # - Trade-off: slightly higher fill risk than 9 bps
+        'target_bps': 9,  # Place at center of 0-10 bps band for max buffer
+        
+        # Order sizing
+        'leverage': 40,  # Leverage multiplier (1x = no leverage, 2x = 2x leverage, etc.)
+        # With 1x leverage, use percentage of balance for single side
+        'balance_percent': 90,  # Use 90% of available balance
+        
+        # Rebalancing
+        'rebalance_interval': 0.1,  # Check every 0.5 seconds (less frequent = less API calls)
+        
+        # Sleep time (in seconds) for all operations
+        'sleep_time': 0,  # Wait time for all sleep operations (cancel orders, close position, place orders, initial delay)
+        
+        # Band monitoring - when to rebalance
+        'min_bps': 8,  # Rebalance if order gets too close to mark (fill risk)
+        'max_bps': 10,  # Rebalance if order drifts too far (before losing 100% tier)
+        
+        # Order side: Always two-sided (buy AND sell)
+        # Each side uses half of balance_percent
+        # e.g., if balance_percent = 85%, each side uses 42.5%
+    }
+}
+
 # Track order start times by side: {"buy": timestamp, "sell": timestamp}
 ORDER_START_TIMES = {}
+# Track last cycle time for debugging
+LAST_CYCLE_TIME = None
 
 
 def format_uptime(seconds):
@@ -56,18 +94,24 @@ def format_uptime(seconds):
         return f"{hours}h{mins}m"
 
 
-def load_config(config_file="config_maker_points.yaml"):
-    """Load configuration file"""
-    if not os.path.isabs(config_file):
-        config_path = os.path.join(current_dir, config_file)
+def load_config(config_file=None):
+    """Load configuration - now uses embedded config by default"""
+    if config_file:
+        # Still support loading from YAML if explicitly provided
+        import yaml
+        if not os.path.isabs(config_file):
+            config_path = os.path.join(current_dir, config_file)
+        else:
+            config_path = config_file
+
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
     else:
-        config_path = config_file
-
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    with open(config_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+        # Use embedded default config
+        return DEFAULT_CONFIG.copy()
 
 
 def calculate_order_price(mark_price, target_bps, side):
@@ -91,24 +135,25 @@ def calculate_order_price(mark_price, target_bps, side):
         # Sell above mark price
         price = Decimal(str(mark_price)) + spread
 
-    # Round to 2 decimal places
-    return price.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    # Round to tick size of 1 $DUSD (changed from 0.1 on Jan 15, 2026)
+    return price.quantize(Decimal("1"), rounding=ROUND_DOWN)
 
 
-def calculate_order_quantity(balance, mark_price, balance_percent):
+def calculate_order_quantity(balance, mark_price, balance_percent, leverage=1):
     """
-    Calculate order quantity based on available balance
+    Calculate order quantity based on available balance and leverage
 
     Args:
         balance: Available balance in USDT
         mark_price: Current mark price
         balance_percent: Percentage of balance to use
+        leverage: Leverage multiplier (default: 1)
 
     Returns:
         Decimal: Order quantity
     """
     usable_balance = Decimal(str(balance)) * Decimal(str(balance_percent)) / Decimal("100")
-    quantity = usable_balance / Decimal(str(mark_price))
+    quantity = usable_balance / Decimal(str(mark_price)) * Decimal(str(leverage))
 
     # Round down to 4 decimal places (BTC precision)
     return quantity.quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
@@ -169,6 +214,9 @@ def run_strategy_cycle(adapter, config, dry_run=False):
     Returns:
         bool: True if successful, False otherwise
     """
+    global LAST_CYCLE_TIME
+    cycle_start = time.time()
+
     symbol = config['symbol']
     mp_config = config['maker_points']
     target_bps = mp_config['target_bps']
@@ -176,7 +224,7 @@ def run_strategy_cycle(adapter, config, dry_run=False):
     min_bps = mp_config.get('min_bps', 1)
     balance_percent = mp_config['balance_percent']
     leverage = mp_config.get('leverage', 1)
-    auto_close = mp_config.get('auto_close_position', True)
+    sleep_time = mp_config.get('sleep_time', 2)
 
     # Each side uses half of balance_percent
     per_side_balance_percent = balance_percent / 2
@@ -196,30 +244,48 @@ def run_strategy_cycle(adapter, config, dry_run=False):
         print(f"❌ 獲取價格失敗: {e}")
         return False
 
-    # 2. Check and close any positions
+    # 2. Check and close any positions, and get existing position leverage
     position_qty = 0
-    if auto_close:
+    existing_position_leverage = None
+    try:
+        position = adapter.get_position(symbol)
+        # Check for any position (size != 0, handles both long and short)
+        if position and position.size != Decimal("0"):
+            position_qty = float(abs(position.size))
+            existing_position_leverage = position.leverage if position.leverage else None
+            
+            # Always auto-close any filled positions
+            actions_log.append(f"🚨 持倉 {position_qty} {position.side} -> 平倉中...")
+            
+            # Cancel all orders first to free up margin
+            try:
+                adapter.cancel_all_orders(symbol=symbol)
+                actions_log.append("🔄 已撤銷所有掛單")
+                time.sleep(sleep_time)
+            except Exception:
+                pass
+            
+            # Close the position
+            adapter.close_position(symbol, order_type="market")
+            actions_log.append("✅ 已平倉")
+            
+            time.sleep(sleep_time)
+            # After closing, reset existing_position_leverage so we use configured leverage
+            existing_position_leverage = None
+    except Exception as e:
+        actions_log.append(f"❌ 平倉失敗: {e}")
+    
+    # Use existing position leverage if available (and not closing), otherwise use configured leverage
+    # StandX API requires leverage to match existing position, or can set for new positions
+    order_leverage = int(existing_position_leverage) if existing_position_leverage else int(leverage)
+
+    # Set leverage on exchange if no existing position (new leverage setting)
+    if not existing_position_leverage and not dry_run:
         try:
-            position = adapter.get_position(symbol)
-            # Check for any position (size != 0, handles both long and short)
-            if position and position.size != Decimal("0"):
-                position_qty = float(abs(position.size))
-                actions_log.append(f"🚨 持倉 {position_qty} {position.side} -> 平倉中...")
-                
-                # Cancel all orders first to free up margin
-                try:
-                    adapter.cancel_all_orders(symbol=symbol)
-                    actions_log.append("🔄 已撤銷所有掛單")
-                    time.sleep(2)
-                except Exception:
-                    pass
-                
-                # Close the position
-                adapter.close_position(symbol, order_type="market")
-                actions_log.append("✅ 已平倉")
-                time.sleep(5)
+            adapter.change_leverage(symbol, order_leverage)
         except Exception as e:
-            actions_log.append(f"❌ 平倉失敗: {e}")
+            # Log but don't fail - leverage might already be set correctly
+            actions_log.append(f"⚠️ 設置槓桿失敗: {e}")
 
     # 3. Get balance - use total equity for order sizing (not available balance)
     try:
@@ -235,7 +301,7 @@ def run_strategy_cycle(adapter, config, dry_run=False):
 
     # Calculate fixed order quantity based on total equity (not remaining balance)
     # This ensures both sides have equal size regardless of which one rebalances
-    fixed_quantity = calculate_order_quantity(total_equity, mark_price, per_side_balance_percent)
+    fixed_quantity = calculate_order_quantity(total_equity, mark_price, per_side_balance_percent, order_leverage)
 
     # 4. Get existing orders for both sides
     existing_orders = get_existing_orders(adapter, symbol)
@@ -311,7 +377,7 @@ def run_strategy_cycle(adapter, config, dry_run=False):
 
     # 6. Wait for balance update if we need to place new orders
     if sides_to_place and not dry_run:
-        time.sleep(5)
+        time.sleep(sleep_time)
         # No need to recalculate - we use fixed quantity based on total equity
 
     # 7. Place new orders
@@ -344,7 +410,7 @@ def run_strategy_cycle(adapter, config, dry_run=False):
                 price=target_price,
                 time_in_force="gtc",
                 reduce_only=False,
-                leverage=leverage
+                leverage=order_leverage
             )
             actions_log.append(f"✅ 掛{side.upper()}單 @ {float(target_price):.2f}")
             ORDER_START_TIMES[side] = time.time()
@@ -360,11 +426,20 @@ def run_strategy_cycle(adapter, config, dry_run=False):
 
     # 8. Display UI (like main.py)
     os.system('clear' if os.name != 'nt' else 'cls')
-    
+
+    # Calculate timing info
+    cycle_duration = time.time() - cycle_start
+    if LAST_CYCLE_TIME:
+        time_since_last = time.time() - LAST_CYCLE_TIME
+        timing_info = f" | 週期: {cycle_duration:.2f}s | 間隔: {time_since_last:.2f}s"
+    else:
+        timing_info = f" | 週期: {cycle_duration:.2f}s"
+    LAST_CYCLE_TIME = time.time()
+
     print(f"=== 🛡️ StandX Maker Points 挖礦策略 (雙邊) ===")
-    print(f"⏰ 時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"⏰ 時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{timing_info}")
     print(f"💰 總權益: ${total_equity:,.2f} | 可用: ${available:,.2f} | 掛單: {balance_percent}% ({per_side_balance_percent:.1f}%/邊)")
-    print(f"📊 即時價格: ${mark_price:,.2f}")
+    print(f"📊 即時價格: ${mark_price:,.2f} | 槓桿: {order_leverage}x")
     print(f"🎯 目標: {target_bps} bps | 安全帶: {min_bps}-{max_bps} bps")
     if position_qty == 0:
         print(f"🛡️ 持倉: (0) 非常安全")
@@ -394,16 +469,20 @@ def run_strategy_cycle(adapter, config, dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(description='StandX Maker Points Strategy')
-    parser.add_argument('-c', '--config', type=str, default='config_maker_points.yaml',
-                        help='Config file path (default: config_maker_points.yaml)')
+    parser.add_argument('-c', '--config', type=str, default=None,
+                        help='Optional config file path (uses embedded config by default)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Simulate without placing orders')
     args = parser.parse_args()
 
     # Load config
     try:
-        print(f"📂 載入設定: {args.config}")
-        config = load_config(args.config)
+        if args.config:
+            print(f"📂 載入設定: {args.config}")
+            config = load_config(args.config)
+        else:
+            print("📂 使用內嵌設定")
+            config = load_config()
     except FileNotFoundError as e:
         print(f"❌ 錯誤: {e}")
         sys.exit(1)
@@ -422,7 +501,6 @@ def main():
 
     print("🚀 啟動 Maker Points 挖礦策略...")
     print("按 Ctrl+C 停止\n")
-    time.sleep(2)
 
     try:
         while True:

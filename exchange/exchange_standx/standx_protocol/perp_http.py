@@ -180,7 +180,8 @@ class StandXPerpHTTP:
         if margin_mode is not None:
             payload["margin_mode"] = margin_mode
         if leverage is not None:
-            payload["leverage"] = leverage
+            # Ensure leverage is an integer
+            payload["leverage"] = int(leverage)
         
         payload_str = json.dumps(payload)
         headers = {
@@ -362,70 +363,76 @@ class StandXPerpHTTP:
             payload["order_id_list"] = order_id_list
         if cl_ord_id_list:
             payload["cl_ord_id_list"] = cl_ord_id_list
-        
+
         payload_str = json.dumps(payload)
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {token}"
         }
-        
+
         # Request signing is required
         if not auth:
             raise ValueError("StandXAuth instance is required for request signing")
-        
+
         # 使用缓存的服务器时间或本地时间进行签名，避免频繁访问 geo 接口导致阻塞
         request_id = str(uuid.uuid4())
         timestamp = self._get_sign_timestamp()
         sign_headers = auth.sign_request(payload_str, request_id, timestamp)
         headers.update(sign_headers)
-        
+
         response = requests.post(url, headers=headers, data=payload_str)
-        
+
         if not response.ok:
             raise ValueError(f"HTTP {response.status_code}: {response.text}")
-        
+
         return response.json()
-    
-    def query_positions(
+
+    def change_leverage(
         self,
         token: str,
-        symbol: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
+        symbol: str,
+        leverage: int,
+        auth: Optional[Any] = None
+    ) -> Dict[str, Any]:
         """
-        Query user positions.
-        
+        Change leverage for a symbol.
+
         Args:
             token: Authentication token
-            symbol: Trading pair (optional, e.g., "BTC-USD")
-            
+            symbol: Trading pair (e.g., "BTC-USD")
+            leverage: Leverage value (integer)
+            auth: StandXAuth instance for request signing (required)
+
         Returns:
-            List of position dictionaries with fields:
-            - id: Position ID
-            - symbol: Trading pair
-            - qty: Position quantity (positive for long, negative for short)
-            - entry_price: Entry price
-            - mark_price: Mark price
-            - upnl: Unrealized PnL
-            - leverage: Leverage
-            - margin_mode: Margin mode ("isolated" or "cross")
-            - status: Position status ("open" or "closed")
-            - and other fields...
-            
+            Response dictionary with code, message, and request_id
+
         Raises:
             ValueError: If request fails
         """
-        url = f"{self.base_url}/api/query_positions"
+        url = f"{self.base_url}/api/change_leverage"
+        payload = {
+            "symbol": symbol,
+            "leverage": int(leverage)
+        }
+
+        payload_str = json.dumps(payload)
         headers = {
+            "Content-Type": "application/json",
             "Authorization": f"Bearer {token}"
         }
-        
-        params = {}
-        if symbol:
-            params["symbol"] = symbol
-        
-        response = requests.get(url, headers=headers, params=params)
-        
+
+        # Request signing is required
+        if not auth:
+            raise ValueError("StandXAuth instance is required for request signing")
+
+        request_id = str(uuid.uuid4())
+        timestamp = self._get_sign_timestamp()
+        sign_headers = auth.sign_request(payload_str, request_id, timestamp)
+        headers.update(sign_headers)
+
+        response = requests.post(url, headers=headers, data=payload_str)
+
         if not response.ok:
             raise ValueError(f"HTTP {response.status_code}: {response.text}")
-        
+
         return response.json()

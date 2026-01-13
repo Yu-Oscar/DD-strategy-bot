@@ -486,14 +486,43 @@ class StandXAdapter(BasePerpAdapter):
     ) -> Dict[str, Any]:
         """
         获取订单簿
-        
+
         注意: StandX API 可能没有公开的订单簿接口
-        
+
         Args:
             symbol: 交易对符号
             depth: 深度，默认 20
-            
+
         Returns:
             Dict[str, Any]: 包含 bids 和 asks 的订单簿数据
         """
         raise NotImplementedError("StandX 订单簿查询功能待实现")
+
+    def change_leverage(self, symbol: str, leverage: int) -> bool:
+        """
+        修改杠杆倍数
+
+        Args:
+            symbol: 交易对符号
+            leverage: 杠杆倍数
+
+        Returns:
+            bool: 是否成功
+        """
+        if not self.token:
+            raise Exception("未认证，请先调用 connect()")
+
+        try:
+            result = self.http_client.change_leverage(
+                token=self.token,
+                symbol=symbol,
+                leverage=leverage,
+                auth=self.auth
+            )
+
+            if result.get("code") != 0:
+                raise Exception(f"修改杠杆失败: {result.get('message', '未知错误')}")
+
+            return True
+        except Exception as e:
+            raise Exception(f"修改杠杆失败: {e}")

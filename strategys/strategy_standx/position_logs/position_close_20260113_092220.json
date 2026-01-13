@@ -1,0 +1,12 @@
+{
+  "timestamp": "2026-01-13T09:22:18.176966",
+  "cycle_duration": 0.711,
+  "time_since_last": 0.813,
+  "config": {
+    "target_bps": 9,
+    "min_bps": 8,
+    "max_bps": 10,
+    "balance_percent": 90,
+    "leverage": 40
+  }
+}
