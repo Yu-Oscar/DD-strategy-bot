@@ -1,0 +1,6 @@
+{
+  "$schema": "https://zeabur.com/schemas/zeabur.json",
+  "build_command": "pip install -r requirements-zeabur.txt",
+  "start_command": "python strategys/strategy_standx/maker_points.py",
+  "python_version": "3.11"
+}

@@ -1,0 +1,8 @@
+# Minimal requirements for Zeabur deployment (no TA-Lib)
+requests>=2.32.0
+python-dotenv>=1.0.0
+cryptography>=41.0.0
+base58>=2.1.0
+web3>=6.0.0
+eth-account>=0.8.0
+pyyaml>=6.0.0
